@@ -3993,12 +3993,33 @@ def rewrite_filters(predicate):
     all OR clauses, we can move it to the front so that we can push it down.
     """
     or_components = _get_predicate_components(predicate, [])
-    if len(or_components) == 1:
+    or_components = _apply_bool_identity(or_components, Or)
+    if len(or_components) == 0:
         return predicate
+    if len(or_components) == 1:
+        return or_components[0]
     result = _replace_common_or_components(or_components[0], or_components[1:])
     if result is None:
         return predicate
     return result
+
+
+def _apply_bool_identity(components, kind):
+    """Fold Python-bool identity operands out of an Or/And component list
+    (#12664). In pandas, ``False | x`` IS ``x`` and ``True & x`` IS ``x`` — the
+    scalar identity operand contributes nothing — and ``x.__ror__(False)``
+    produces an Or holding a raw ``bool`` on one side. The rewriter here
+    dereferences each component's ``_name``, so an un-folded bool crashes with
+    ``AttributeError: 'bool' object has no attribute '_name'``. Folding here
+    matches pandas semantics for the identity operand.
+
+    The absorbing operands (``True | x``, ``False & x``) are left in place and
+    the rewrite declines (``_replace_common_or_components`` returns None), so
+    the predicate computes blockwise — ``True | x`` and ``False & x`` are
+    element-wise bool, matching pandas.
+    """
+    identity = False if kind is Or else True  # noqa: SIM211 — plain constants read better
+    return [c for c in components if not (isinstance(c, bool) and c is identity)]
 
 
 def _get_predicate_components(predicate, components, type_=Or):
@@ -4017,14 +4038,18 @@ def _get_predicate_components(predicate, components, type_=Or):
 
 
 def _convert_mapping(components):
+    components = [e for e in components if isinstance(e, Expr) and hasattr(e, "_name")]
     return dict(zip([e._name for e in components], components))
 
 
 def _replace_common_or_components(expr, or_components):
-    and_component = _get_predicate_components(expr, [], type_=And)
+    and_component = _apply_bool_identity(
+        _get_predicate_components(expr, [], type_=And), And
+    )
     mapping = _convert_mapping(and_component)
     and_components = [
-        _get_predicate_components(c, [], type_=And) for c in or_components
+        _apply_bool_identity(_get_predicate_components(c, [], type_=And), And)
+        for c in or_components
     ]
     and_components = list(map(_convert_mapping, and_components))
 
